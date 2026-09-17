@@ -44,6 +44,7 @@ from ..dataset import (
     Transaction,
     UpdateResult,
     Version,
+    VersionRef,
 )
 from ..fragment import (
     DataFile,
@@ -53,6 +54,7 @@ from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
+from .bitmap import Bitmap as Bitmap
 from .debug import format_fragment as format_fragment
 from .debug import format_manifest as format_manifest
 from .debug import format_schema as format_schema
@@ -62,6 +64,9 @@ from .fragment import (
 )
 from .fragment import (
     RowIdMeta as RowIdMeta,
+)
+from .fragment import (
+    RowIdSequence as RowIdSequence,
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
@@ -105,6 +110,37 @@ class MetricDescription:
 def register_lance_metrics_recorder() -> bool: ...
 def lance_metrics_catalog() -> List[MetricDescription]: ...
 def snapshot_lance_metrics() -> List[MetricPoint]: ...
+
+class FtsToken:
+    text: str
+    position: int
+    def __repr__(self) -> str: ...
+
+def tokenize(
+    query: str,
+    *,
+    analyzer: Optional[Literal["text", "code"]] = None,
+    base_tokenizer: Optional[str] = None,
+    language: Optional[str] = None,
+    max_token_length: Optional[int] = 40,
+    lower_case: Optional[bool] = None,
+    stem: Optional[bool] = None,
+    remove_stop_words: Optional[bool] = None,
+    custom_stop_words: Optional[List[str]] = None,
+    ascii_folding: Optional[bool] = None,
+    min_ngram_length: Optional[int] = None,
+    max_ngram_length: Optional[int] = None,
+    prefix_only: Optional[bool] = None,
+    split_identifiers: Optional[bool] = None,
+    split_on_numerics: Optional[bool] = None,
+    preserve_original: Optional[bool] = None,
+    index_operators: Optional[bool] = None,
+) -> List[FtsToken]:
+    """Tokenize an FTS query without an index.
+
+    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    """
+    ...
 
 class CleanupStats:
     bytes_removed: int
@@ -171,7 +207,13 @@ class PackedBlobWriter:
     def write_blob(self, data: bytes) -> None: ...
     def write_blobs(
         self,
-        payloads: Union[pa.BinaryArray, pa.LargeBinaryArray, pa.ChunkedArray],
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
     ) -> None: ...
     def finish(self) -> List[BlobDescriptor]: ...
     def finish_array(self, field_name: str) -> pa.StructArray: ...
@@ -311,7 +353,11 @@ class LanceBlobFile:
     def tell(self) -> int: ...
     def size(self) -> int: ...
     def readall(self) -> bytes: ...
+    def read_range(self, offset: int, length: int) -> bytes: ...
+    def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
+    def set_buffer_size(self, buffer_size: int) -> None: ...
+    def _range_submission_count(self) -> int: ...
 
 class _Dataset:
     @property
@@ -342,6 +388,7 @@ class _Dataset:
     def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
+    def base_paths(self) -> Dict[int, DatasetBasePath]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
     def remap_row_addrs(self, addrs: pa.Array) -> Optional[pa.Array]: ...
     def scanner(
@@ -447,9 +494,13 @@ class _Dataset:
         self,
         updates: Dict[str, str],
         predicate: Optional[str] = None,
+        conflict_retries: Optional[int] = None,
+        retry_timeout: Optional[timedelta] = None,
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def versions(self) -> List[Version]: ...
+    def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
     def latest_version(self) -> int: ...
     def checkout_version(
@@ -634,6 +685,10 @@ class _MergeInsertBuilder:
     def when_matched_fail(self) -> Self: ...
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
+    def write_mode(
+        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
+    ) -> Self: ...
+    def data_storage_version(self, version: str) -> Self: ...
     def target_bases(self, bases: list[str]) -> Self: ...
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
@@ -688,6 +743,12 @@ class _Fragment:
         batch_readahead: Optional[int] = None,
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
@@ -709,6 +770,7 @@ class _Fragment:
     def physical_rows(self) -> int: ...
     @property
     def num_deletions(self) -> int: ...
+    def validate(self) -> None: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...
@@ -735,6 +797,7 @@ def _write_fragments(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -755,6 +818,7 @@ def _write_fragments_transaction(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
@@ -952,6 +1016,14 @@ class DatasetBasePath:
         is_dataset_root: bool = False,
         id: Optional[int] = None,
     ) -> None: ...
+    @property
+    def id(self) -> int: ...
+    @property
+    def name(self) -> Optional[str]: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def is_dataset_root(self) -> bool: ...
 
 __version__: str
 language_model_home: Callable[[], str]

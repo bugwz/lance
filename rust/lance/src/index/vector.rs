@@ -8,6 +8,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+mod bounded_partition_stream;
 pub mod builder;
 pub(crate) mod details;
 pub mod hamming;
@@ -27,7 +28,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
@@ -510,6 +511,9 @@ impl IndexParams for VectorIndexParams {
 /// These paths emit different file layouts, but they follow the same rules for
 /// validating the vector column, deriving the effective index type, sizing IVF
 /// partitions, and constructing the shuffler.
+///
+/// The shuffler carries only the path of its scratch directory, so the returned
+/// [`TempStdDir`] guard owns that directory: hold it until the build finishes.
 async fn prepare_vector_segment_build(
     dataset: &Dataset,
     column: &str,
@@ -518,7 +522,13 @@ async fn prepare_vector_segment_build(
     mode: &str,
     require_precomputed_ivf: bool,
     fragment_ids: Option<&[u32]>,
-) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
+) -> Result<(
+    DataType,
+    IndexType,
+    IvfBuildParams,
+    Box<dyn Shuffler>,
+    TempStdDir,
+)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -595,7 +605,7 @@ async fn prepare_vector_segment_build(
         Some(progress),
     );
 
-    Ok((element_type, index_type, ivf_params, shuffler))
+    Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -607,20 +617,21 @@ pub(crate) async fn build_distributed_vector_index(
     _name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Distributed Vector Index",
-        true,
-        Some(fragment_ids),
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Distributed Vector Index",
+            true,
+            Some(fragment_ids),
+        )
+        .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -655,6 +666,12 @@ pub(crate) async fn build_distributed_vector_index(
             .codebook
             .clone()
             .expect("checked above that PQ codebook is present");
+        lance_index::vector::pq::validate_supplied_codebook(
+            pre_codebook.len(),
+            dim,
+            pq_params.num_sub_vectors,
+            pq_params.num_bits,
+        )?;
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
 
@@ -960,7 +977,7 @@ pub(crate) async fn build_vector_index(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
     build_vector_index_impl(
@@ -984,7 +1001,7 @@ pub(crate) async fn build_filtered_vector_index(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -1008,20 +1025,21 @@ async fn build_vector_index_impl(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<Vec<IndexFile>> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Vector Index",
-        false,
-        fragment_ids,
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Vector Index",
+            false,
+            fragment_ids,
+        )
+        .await?;
     let stages = &params.stages;
 
     match index_type {
@@ -1295,7 +1313,7 @@ pub(crate) async fn build_vector_index_incremental(
     uuid: Uuid,
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<VectorIndexBuildSummary> {
     let stages = &params.stages;
@@ -1617,7 +1635,7 @@ pub(crate) async fn open_vector_index(
     uuid: &Uuid,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
@@ -1712,7 +1730,7 @@ pub(crate) async fn open_vector_index_v2(
     column: &str,
     uuid: &Uuid,
     reader: V1FileReader,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()
@@ -1947,6 +1965,7 @@ pub async fn initialize_vector_index(
         uuid: new_uuid,
         name: source_index.name.clone(),
         fields: vec![field.id],
+        covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
         index_details: source_index.index_details.clone(),
@@ -2263,25 +2282,27 @@ mod tests {
         let uri = format!("{}/ds", test_dir.as_str());
 
         let reader = lance_datagen::gen_batch()
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
 
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             MetricType::L2,
             IvfBuildParams {
-                num_partitions: Some(8),
+                num_partitions: Some(2),
+                max_iters: 2,
+                sample_rate: 2,
                 ..Default::default()
             },
-            HnswBuildParams {
-                max_level: 6,
-                m: 24,
-                ef_construction: 120,
-                prefetch_distance: None,
-            },
+            HnswBuildParams::default()
+                .max_level(2)
+                .num_edges(4)
+                .ef_construction(16),
             PQBuildParams {
-                num_sub_vectors: 8,
-                num_bits: 8,
+                num_sub_vectors: 2,
+                num_bits: 4,
+                max_iters: 2,
+                sample_rate: 2,
                 ..Default::default()
             },
         );
@@ -2519,6 +2540,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
+    }
+
+    /// The scratch directory the guard owns has to be gone once the build is
+    /// over, or the OS temp dir grows by one shuffled copy of the vector column
+    /// per index build.
+    ///
+    /// The OS temp dir is process-global, so an in-process check cannot
+    /// attribute a leftover directory to our own build. This test re-executes
+    /// itself in a child process with `TMPDIR` pointed at an isolated dir we
+    /// own: the child builds, the parent asserts nothing survives. Same shape as
+    /// `index::vector::ivf::io::tests::test_hnsw_pq_scratch_dir_is_not_leaked`,
+    /// which covers the legacy partition-staging dir.
+    #[test]
+    fn test_shuffle_scratch_dir_is_not_leaked() {
+        const ROOT_VAR: &str = "LANCE_SHUFFLE_LEAK_TEST_ROOT";
+
+        // Child half: build under the root the parent handed us and let it do the
+        // leak detection. The dataset goes outside the temp dir's `.tmp*` namespace
+        // so the parent never mistakes it for a leaked scratch directory. Read the
+        // value as an `OsString`: with `env::var`, a root that is not valid UTF-8
+        // would send the child down the parent branch and have it spawn a child of
+        // its own, without end.
+        if let Some(root) = std::env::var_os(ROOT_VAR) {
+            let root = root
+                .into_string()
+                .expect("the isolated root must be valid UTF-8");
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let uri = format!("{root}/dataset");
+                    let reader = lance_datagen::gen_batch()
+                        .col("id", array::step::<Int32Type>())
+                        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+                        .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+                    let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+                    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+                    for i in 0..2 {
+                        dataset
+                            .create_index(
+                                &["vector"],
+                                IndexType::Vector,
+                                Some(format!("vector_idx_{i}")),
+                                &params,
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                });
+            return;
+        }
+
+        let isolated_root = TempStdDir::default();
+        // libtest names the thread after the running test, so the child's filter
+        // cannot drift out of sync with this function's name.
+        let this_test = std::thread::current().name().unwrap().to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&this_test, "--exact", "--nocapture"])
+            .env("TMPDIR", isolated_root.as_ref())
+            .env(ROOT_VAR, isolated_root.as_ref())
+            .output()
+            .expect("failed to spawn child test process");
+        assert!(
+            output.status.success(),
+            "child build process failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
+        assert!(
+            isolated_root.join("dataset").is_dir(),
+            "the child process did not run the build; filter was {this_test:?}"
+        );
+
+        // Every scratch dir a build creates sits directly under TMPDIR and is
+        // owned by a guard, so none should survive the child process.
+        let leaked: Vec<std::path::PathBuf> = std::fs::read_dir(&isolated_root)
+            .expect("read isolated temp root")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".tmp"))
+            })
+            .collect();
+
+        assert!(
+            leaked.is_empty(),
+            "vector index build leaked scratch directories under the temp dir: {leaked:?}"
+        );
     }
 
     #[tokio::test]
@@ -2931,7 +3048,8 @@ mod tests {
             .await
             .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
-        let mut v2w = lance_file::versions::v2_1::create_writer(
+        let mut v2w = lance_file::versions::create_writer(
+            dataset_format_version(&dataset),
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap(),
             FileWriterOptions::default(),
@@ -3404,29 +3522,33 @@ mod tests {
         let source_uri = format!("{}/source", test_dir.as_str());
         let target_uri = format!("{}/target", test_dir.as_str());
 
-        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        // A 4-bit PQ codebook needs at least 16 training rows.
         let source_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
         let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
             .await
             .unwrap();
 
         // Create IVF_HNSW_PQ index on source with custom HNSW parameters
         let ivf_params = IvfBuildParams {
-            num_partitions: Some(8),
+            num_partitions: Some(2),
+            max_iters: 2,
+            sample_rate: 2,
             ..Default::default()
         };
         let hnsw_params = HnswBuildParams {
-            max_level: 6,
-            m: 24,
-            ef_construction: 120,
+            max_level: 2,
+            m: 4,
+            ef_construction: 16,
             prefetch_distance: None,
         };
         let pq_params = PQBuildParams {
-            num_sub_vectors: 8,
-            num_bits: 8,
+            num_sub_vectors: 2,
+            num_bits: 4,
+            max_iters: 2,
+            sample_rate: 2,
             ..Default::default()
         };
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -3458,8 +3580,8 @@ mod tests {
         // Create target dataset with same schema
         let target_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1));
         let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
             .await
             .unwrap();
@@ -3506,8 +3628,8 @@ mod tests {
         // Check number of partitions
         assert_eq!(
             stats.get("num_partitions").and_then(|v| v.as_u64()),
-            Some(8),
-            "Should have 8 partitions"
+            Some(2),
+            "Should have 2 partitions"
         );
 
         // Verify centroids are shared between source and target indices
@@ -3568,13 +3690,13 @@ mod tests {
         // Verify PQ parameters
         assert_eq!(
             sub_index.get("nbits").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should use 8 bits"
+            Some(4),
+            "PQ should use 4 bits"
         );
         assert_eq!(
             sub_index.get("num_sub_vectors").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should have 8 sub vectors"
+            Some(2),
+            "PQ should have 2 sub vectors"
         );
 
         // Verify IVF parameters are correctly derived
@@ -3586,8 +3708,8 @@ mod tests {
         );
         assert_eq!(
             target_ivf_params.num_partitions,
-            Some(8),
-            "Should have 8 partitions as configured"
+            Some(2),
+            "Should have 2 partitions as configured"
         );
 
         // Verify PQ parameters are correctly derived
@@ -3608,29 +3730,29 @@ mod tests {
             "PQ num_bits should match"
         );
         assert_eq!(
-            target_pq_params.num_sub_vectors, 8,
-            "PQ should have 8 sub vectors"
+            target_pq_params.num_sub_vectors, 2,
+            "PQ should have 2 sub vectors"
         );
-        assert_eq!(target_pq_params.num_bits, 8, "PQ should use 8 bits");
+        assert_eq!(target_pq_params.num_bits, 4, "PQ should use 4 bits");
 
         // Verify HNSW parameters are extracted and used correctly
         let derived_hnsw_params = derive_hnsw_params(target_vector_index.as_ref());
         assert_eq!(
-            derived_hnsw_params.max_level, 6,
-            "HNSW max_level should be extracted as 6 from source index"
+            derived_hnsw_params.max_level, 2,
+            "HNSW max_level should be extracted as 2 from source index"
         );
         assert_eq!(
-            derived_hnsw_params.m, 24,
-            "HNSW m should be extracted as 24 from source index"
+            derived_hnsw_params.m, 4,
+            "HNSW m should be extracted as 4 from source index"
         );
         assert_eq!(
-            derived_hnsw_params.ef_construction, 120,
-            "HNSW ef_construction should be extracted as 120 from source index"
+            derived_hnsw_params.ef_construction, 16,
+            "HNSW ef_construction should be extracted as 16 from source index"
         );
 
         // Verify the index is functional
         let query_vector = lance_datagen::gen_batch()
-            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .anon_col(array::rand_vec::<Float32Type>(8.into()))
             .into_batch_rows(RowCount::from(1))
             .unwrap()
             .column(0)

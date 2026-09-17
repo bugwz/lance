@@ -18,6 +18,7 @@ pub(crate) mod knn;
 mod optimizer;
 mod projection;
 mod pushdown_scan;
+pub(crate) mod row_addr_mask;
 mod rowids;
 pub mod scalar_index;
 mod scan;
@@ -29,13 +30,18 @@ pub mod testing;
 pub mod utils;
 
 pub use filter::LanceFilterExec;
-pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
+pub use knn::{
+    ANNIvfBatchExec, ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec,
+    QUERY_INDEX_COL,
+};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
 pub use optimizer::get_physical_optimizer;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
+pub use row_addr_mask::RowAddrMaskFilterExec;
 pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
+pub(crate) use scan::LanceStream;
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;

@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
 from .blob import (
@@ -44,10 +44,12 @@ from .lance import (
     CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
+    FtsToken,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
     simd_info,
+    tokenize,
 )
 from .mem_wal import (
     CompactedSsTable,
@@ -98,6 +100,7 @@ __all__ = [
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",
+    "FtsToken",
     "Index",
     "IndexFile",
     "LanceDataset",
@@ -117,6 +120,7 @@ __all__ = [
     "schema_to_json",
     "set_logger",
     "simd_info",
+    "tokenize",
     "write_dataset",
     "FFILanceTableProvider",
     "IndexProgress",
@@ -144,7 +148,7 @@ def dataset(
     default_scan_options: Optional[Dict[str, str]] = None,
     metadata_cache_size_bytes: Optional[int] = None,
     index_cache_size_bytes: Optional[int] = None,
-    read_params: Optional[Dict[str, any]] = None,
+    read_params: Optional[Dict[str, Any]] = None,
     session: Optional[Session] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,

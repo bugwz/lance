@@ -867,8 +867,8 @@ fn write_transaction_operation(
             write_kv(
                 f,
                 indent,
-                "merged_generations",
-                &update.merged_generations.len().to_string(),
+                "compacted_sstables",
+                &update.compacted_sstables.len().to_string(),
             )?;
             write_kv(
                 f,
@@ -973,8 +973,8 @@ fn write_transaction_operation(
             write_kv(
                 f,
                 indent,
-                "merged_generations",
-                &update_mem_wal_state.merged_generations.len().to_string(),
+                "compacted_sstables",
+                &update_mem_wal_state.compacted_sstables.len().to_string(),
             )
         }
         pb::transaction::Operation::Clone(clone) => {

@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
+use futures::TryStreamExt;
 use lance_file::{
     version::ConcreteFileVersion,
     versions::v1::{
@@ -21,9 +22,12 @@ use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
     object_store::ObjectStore,
     traits::{WriteExt, Writer},
+    utils::{METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
 use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
+
+use super::commit::ManifestLocation;
 
 /// Read the raw Manifest protobuf from a URI.
 ///
@@ -99,20 +103,22 @@ async fn read_manifest_bytes(
         // The prefetch captured the entire manifest. We just need to trim the buffer.
         buf.slice(buf.len() - manifest_len..buf.len())
     } else {
-        // The prefetch only captured part of the manifest. We need to make an
-        // additional range request to read the remainder.
-        let mut buf2: BytesMut = object_store
-            .inner
-            .get_range(
-                path,
-                Range {
-                    start: manifest_pos as u64,
-                    end: file_size - PREFETCH_SIZE,
-                },
-            )
-            .await?
-            .into_iter()
-            .collect();
+        // The prefetch only captured part of the manifest. Fetch the remainder
+        // as concurrent chunked range requests: a single GET is limited to one
+        // connection's throughput, which dominates load time for manifests of
+        // datasets with many fragments.
+        let reader = object_store
+            .open_with_size(path, file_size as usize)
+            .await?;
+        let mut buf2 = BytesMut::with_capacity(manifest_len);
+        let mut chunks = read_range_in_chunks(
+            reader.as_ref(),
+            manifest_pos..(file_size - PREFETCH_SIZE) as usize,
+            METADATA_READ_CHUNK_SIZE,
+        );
+        while let Some(chunk) = chunks.try_next().await? {
+            buf2.extend_from_slice(&chunk);
+        }
         buf2.extend_from_slice(&buf);
         buf2.freeze()
     };
@@ -164,6 +170,53 @@ pub async fn read_manifest(
     Manifest::try_from(proto)
 }
 
+#[instrument(level = "debug", skip(object_store, manifest))]
+pub async fn read_manifest_indexes(
+    object_store: &ObjectStore,
+    location: &ManifestLocation,
+    manifest: &Manifest,
+) -> Result<Vec<IndexMetadata>> {
+    if let Some(pos) = manifest.index_section.as_ref() {
+        let result = read_index_section(object_store, &location.path, location.size, *pos).await;
+        // A stale cached size makes the index offset fall outside the sized view,
+        // so the read fails as "file size is too small". Retry once with the true
+        // size; surface any other error unchanged.
+        let section = match result {
+            Err(e)
+                if location.size.is_some() && e.to_string().contains("file size is too small") =>
+            {
+                read_index_section(object_store, &location.path, None, *pos).await?
+            }
+            other => other?,
+        };
+
+        let indices = section
+            .indices
+            .into_iter()
+            .map(IndexMetadata::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(indices)
+    } else {
+        Ok(vec![])
+    }
+}
+
+/// Read the index section message at `pos`, opening the manifest with a known
+/// size when one is provided.
+async fn read_index_section(
+    object_store: &ObjectStore,
+    path: &Path,
+    size: Option<u64>,
+    pos: usize,
+) -> Result<pb::IndexSection> {
+    let reader = if let Some(size) = size {
+        object_store.open_with_size(path, size as usize).await?
+    } else {
+        object_store.open(path).await?
+    };
+    read_message(reader.as_ref(), pos).await
+}
+
 async fn do_write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
@@ -177,6 +230,10 @@ async fn do_write_manifest(
         };
         let pos = writer.write_protobuf(&section).await?;
         manifest.index_section = Some(pos);
+    } else {
+        // No index section is written to this file, so an inherited offset
+        // would point at unrelated bytes in the new manifest file.
+        manifest.index_section = None;
     }
 
     // Write inline transaction if presented.
@@ -185,6 +242,11 @@ async fn do_write_manifest(
         let pb_tx: pb::Transaction = tx.into();
         let pos = writer.write_protobuf(&pb_tx).await?;
         manifest.transaction_section = Some(pos);
+    } else {
+        // No inline copy is written to this file. Clear any offset inherited
+        // from a previous manifest (e.g. via restore or clone), which would
+        // otherwise point at arbitrary bytes of the file being written.
+        manifest.transaction_section = None;
     }
 
     writer.write_struct(manifest).await
@@ -263,11 +325,8 @@ mod test {
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(manifest_min_size)
-            .map(char::from)
-            .collect();
+        // A cheap deterministic filler; only the size matters for these tests.
+        let long_name: String = "a".repeat(manifest_min_size);
 
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
@@ -334,6 +393,40 @@ mod test {
 
         assert_eq!(expected, roundtripped_manifest);
         store.inner.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_larger_than_read_chunk() {
+        // Crosses METADATA_READ_CHUNK_SIZE so the manifest body is fetched as
+        // multiple concurrent chunks and reassembled with the prefetched tail.
+        test_roundtrip_manifest(1000, METADATA_READ_CHUNK_SIZE + 4 * 1024 * 1024).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_clears_unwritten_index_section() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/clear_unwritten_index_section");
+        let mut writer = store.create(&path).await.unwrap();
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.index_section = Some(42);
+
+        let pos = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        assert!(manifest.index_section.is_none());
+        let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
+        assert!(roundtripped_manifest.index_section.is_none());
     }
 
     #[tokio::test]
